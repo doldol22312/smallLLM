@@ -84,6 +84,20 @@ Then train on `data/wiki.clean.txt`.
 - `--z_loss 1e-4` (logit stabilization)
 - `--optimizer lion` (alternative optimizer)
 
+## Distributed (Multi-GPU) Training (DDP)
+
+If you have multiple GPUs, launch with `torchrun` and enable DDP:
+
+```bash
+torchrun --standalone --nproc_per_node=2 train_tinyllm.py --ddp --out_dir out/ddp_run --data_path data/wiki.clean.txt --tokenizer bpe --memmap_dataset --amp
+```
+
+Notes:
+
+- `--batch_size` is **per GPU**. Effective batch is `batch_size * grad_accum_steps * world_size`.
+- Only rank 0 writes checkpoints/logs to `--out_dir`.
+- Backend defaults to `--ddp_backend auto` (NCCL on Linux+CUDA, otherwise Gloo).
+
 ## Generate Text
 
 After training, sample from the latest checkpoint:

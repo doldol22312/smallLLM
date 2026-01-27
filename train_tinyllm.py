@@ -6,7 +6,9 @@ import os
 import random
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, fields
+from datetime import timedelta
 
 import torch
 import torch.nn as nn
@@ -77,6 +79,10 @@ class TrainConfig:
 
     # Runtime
     device: str = "auto"  # auto|cpu|cuda
+    ddp: bool = False
+    ddp_backend: str = "auto"  # auto|nccl|gloo
+    ddp_find_unused_parameters: bool = False
+    ddp_timeout: int = 1800
     kv_cache: bool = False
     temperature: float = 1.0
     top_k: int = 0
@@ -84,6 +90,19 @@ class TrainConfig:
     repetition_penalty: float = 1.0
     label_smoothing: float = 0.0
     z_loss: float = 0.0
+
+
+@dataclass(frozen=True)
+class DdpInfo:
+    enabled: bool = False
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+    backend: str = "gloo"
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
 
 
 class RMSNorm(nn.Module):
@@ -920,6 +939,59 @@ def _device_from_cfg(device: str) -> str:
     return "cpu"
 
 
+def _init_ddp(*, cfg: TrainConfig, device_str: str) -> DdpInfo:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    enabled = bool(cfg.ddp) or world_size > 1
+    if not enabled:
+        return DdpInfo()
+
+    if world_size <= 1:
+        raise RuntimeError(
+            "DDP enabled but WORLD_SIZE=1. Launch with torchrun, e.g.:\n"
+            "  torchrun --standalone --nproc_per_node=2 train_tinyllm.py --ddp ..."
+        )
+
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    try:
+        import torch.distributed as dist
+    except Exception as e:
+        raise RuntimeError(
+            "DDP requested but torch.distributed is unavailable in this PyTorch build."
+        ) from e
+
+    backend_cfg = (cfg.ddp_backend or "auto").lower()
+    if backend_cfg == "auto":
+        backend = (
+            "nccl"
+            if device_str == "cuda" and dist.is_nccl_available()
+            else "gloo"
+        )
+    else:
+        backend = backend_cfg
+
+    if backend == "nccl" and not dist.is_nccl_available():
+        if rank == 0:
+            print("warning: NCCL backend not available; falling back to gloo.")
+        backend = "gloo"
+
+    # Set per-process device before initializing NCCL.
+    if device_str == "cuda":
+        torch.cuda.set_device(local_rank)
+
+    dist.init_process_group(
+        backend=backend, init_method="env://", timeout=timedelta(seconds=int(cfg.ddp_timeout))
+    )
+    return DdpInfo(
+        enabled=True,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        backend=backend,
+    )
+
+
 def _get_batch(
     data: torch.Tensor,
     *,
@@ -1110,6 +1182,30 @@ def _parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"])
+    parser.add_argument(
+        "--ddp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable DistributedDataParallel (launch with torchrun).",
+    )
+    parser.add_argument(
+        "--ddp_backend",
+        default=None,
+        choices=["auto", "nccl", "gloo"],
+        help="DDP backend (auto/nccl/gloo).",
+    )
+    parser.add_argument(
+        "--ddp_find_unused_parameters",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Pass find_unused_parameters=True to DDP (slower).",
+    )
+    parser.add_argument(
+        "--ddp_timeout",
+        type=int,
+        default=None,
+        help="torch.distributed init timeout (seconds).",
+    )
     parser.add_argument("--seed", type=int, default=None)
 
     parser.add_argument("--generate_only", action="store_true")
@@ -1336,6 +1432,10 @@ def main() -> None:
             "scaled_init": args.scaled_init,
             "weight_tying": args.weight_tying,
             "device": args.device,
+            "ddp": args.ddp,
+            "ddp_backend": args.ddp_backend,
+            "ddp_find_unused_parameters": args.ddp_find_unused_parameters,
+            "ddp_timeout": args.ddp_timeout,
             "seed": args.seed,
             "prompt": args.prompt,
             "sample_chars": args.sample_chars,
@@ -1432,6 +1532,10 @@ def main() -> None:
                     "layerdrop": args.layerdrop,
                     "scaled_init": args.scaled_init,
                     "device": args.device,
+                    "ddp": args.ddp,
+                    "ddp_backend": args.ddp_backend,
+                    "ddp_find_unused_parameters": args.ddp_find_unused_parameters,
+                    "ddp_timeout": args.ddp_timeout,
                     "seed": args.seed,
                     "prompt": args.prompt,
                     "sample_chars": args.sample_chars,
@@ -1457,14 +1561,26 @@ def main() -> None:
     if cfg.layerdrop < 0 or cfg.layerdrop >= 1:
         raise ValueError("--layerdrop must be in [0, 1)")
 
-    _write_json(os.path.join(cfg.out_dir, "effective_config.json"), asdict(cfg))
-
-    random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-
     device_str = _device_from_cfg(cfg.device)
-    device = torch.device(device_str)
-    print(f"Device: {device_str}")
+    ddp = _init_ddp(cfg=cfg, device_str=device_str)
+    is_main_process = (not ddp.enabled) or ddp.is_main
+
+    if ddp.enabled and device_str == "cuda":
+        device = torch.device("cuda", ddp.local_rank)
+    else:
+        device = torch.device(device_str)
+
+    if is_main_process:
+        if ddp.enabled:
+            print(f"DDP: world_size={ddp.world_size} backend={ddp.backend}")
+        print(f"Device: {device}")
+
+    if is_main_process:
+        _write_json(os.path.join(cfg.out_dir, "effective_config.json"), asdict(cfg))
+
+    seed = int(cfg.seed) + (ddp.rank if ddp.enabled else 0)
+    random.seed(seed)
+    torch.manual_seed(seed)
 
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -1484,11 +1600,20 @@ def main() -> None:
     text: str | None = None
 
     tokenizer_json_path = os.path.join(cfg.out_dir, "tokenizer.json")
+    dist = None
+    if ddp.enabled:
+        import torch.distributed as dist
 
     if checkpoint is not None:
         tokenizer = _tokenizer_from_checkpoint(checkpoint)
-        if isinstance(tokenizer, BpeTokenizer) and not os.path.exists(tokenizer_json_path):
+        if (
+            is_main_process
+            and isinstance(tokenizer, BpeTokenizer)
+            and not os.path.exists(tokenizer_json_path)
+        ):
             _write_text(tokenizer_json_path, tokenizer.to_json())
+        if ddp.enabled:
+            dist.barrier()
     else:
         if cfg.tokenizer == "char":
             if not os.path.exists(cfg.data_path):
@@ -1501,25 +1626,37 @@ def main() -> None:
                 text = _read_text(cfg.data_path)
                 tokenizer = CharTokenizer(text)
         elif cfg.tokenizer == "bpe":
-            if os.path.exists(tokenizer_json_path):
-                tokenizer = BpeTokenizer.from_json(_read_text(tokenizer_json_path))
-            else:
+            if not os.path.exists(tokenizer_json_path):
                 if not os.path.exists(cfg.data_path):
                     raise FileNotFoundError(
                         f"Missing dataset at {cfg.data_path!r}. Provide --data_path or create the file."
                     )
-                tokenizer = BpeTokenizer.train(
-                    data_path=cfg.data_path,
-                    vocab_size=cfg.bpe_vocab_size,
-                    min_frequency=cfg.bpe_min_frequency,
-                )
-                _write_text(tokenizer_json_path, tokenizer.to_json())
+                if is_main_process:
+                    tokenizer = BpeTokenizer.train(
+                        data_path=cfg.data_path,
+                        vocab_size=cfg.bpe_vocab_size,
+                        min_frequency=cfg.bpe_min_frequency,
+                    )
+                    _write_text(tokenizer_json_path, tokenizer.to_json())
+                if ddp.enabled:
+                    dist.barrier()
+
+            # All ranks load the tokenizer from disk to ensure consistency.
+            tokenizer = BpeTokenizer.from_json(_read_text(tokenizer_json_path))
         else:
             raise ValueError(f"Unknown tokenizer: {cfg.tokenizer!r}")
 
     if not args.generate_only:
         if cfg.memmap_dataset:
-            data = _load_or_build_memmap_tokens(cfg=cfg, tokenizer=tokenizer)
+            if ddp.enabled:
+                if is_main_process:
+                    data = _load_or_build_memmap_tokens(cfg=cfg, tokenizer=tokenizer)
+                dist.barrier()
+                if not is_main_process:
+                    data = _load_or_build_memmap_tokens(cfg=cfg, tokenizer=tokenizer)
+                dist.barrier()
+            else:
+                data = _load_or_build_memmap_tokens(cfg=cfg, tokenizer=tokenizer)
             split_idx = int(0.9 * data.size(0))
             train_data = data[:split_idx]
             val_data = data[split_idx:]
@@ -1546,6 +1683,25 @@ def main() -> None:
         best_val = float(checkpoint.get("best_val", best_val))
 
     model = model.to(device)
+
+    model_train: nn.Module = model
+    if ddp.enabled:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+
+        if device.type == "cuda":
+            model_train = DDP(
+                model,
+                device_ids=[int(device.index)],
+                output_device=int(device.index),
+                broadcast_buffers=False,
+                find_unused_parameters=bool(cfg.ddp_find_unused_parameters),
+            )
+        else:
+            model_train = DDP(
+                model,
+                broadcast_buffers=False,
+                find_unused_parameters=bool(cfg.ddp_find_unused_parameters),
+            )
 
     optimizer = None
     scaler: torch.amp.GradScaler | None = None
@@ -1575,16 +1731,17 @@ def main() -> None:
             device=device.type, enabled=use_amp and amp_dtype == torch.float16
         )
 
-    model_fwd: nn.Module = model
+    model_fwd: nn.Module = model_train
     if not args.generate_only and cfg.compile:
         if not hasattr(torch, "compile"):
-            print("warning: torch.compile not available; continuing without compilation.")
+            if is_main_process:
+                print("warning: torch.compile not available; continuing without compilation.")
         else:
             mode = cfg.compile_mode or None
             backend = cfg.compile_backend or "inductor"
             try:
                 compiled = torch.compile(
-                    model,
+                    model_train,
                     backend=backend,
                     mode=mode,
                     fullgraph=bool(cfg.compile_fullgraph),
@@ -1603,35 +1760,49 @@ def main() -> None:
                     ):
                         compiled(x0, y0)
                 except Exception as e:
-                    print(
-                        f"warning: torch.compile backend {backend!r} failed ({e}); "
-                        "continuing without compilation."
-                    )
-                    model_fwd = model
+                    if is_main_process:
+                        print(
+                            f"warning: torch.compile backend {backend!r} failed ({e}); "
+                            "continuing without compilation."
+                        )
+                    model_fwd = model_train
                 else:
                     model_fwd = compiled
-                    print(
-                        "torch.compile enabled"
-                        f" (backend={backend}, mode={mode or 'default'}, fullgraph={bool(cfg.compile_fullgraph)}, dynamic={cfg.compile_dynamic})"
-                    )
+                    if is_main_process:
+                        print(
+                            "torch.compile enabled"
+                            f" (backend={backend}, mode={mode or 'default'}, fullgraph={bool(cfg.compile_fullgraph)}, dynamic={cfg.compile_dynamic})"
+                        )
             except Exception as e:
-                print(f"warning: torch.compile failed ({e}); continuing without compilation.")
-                model_fwd = model
+                if is_main_process:
+                    print(f"warning: torch.compile failed ({e}); continuing without compilation.")
+                model_fwd = model_train
 
     if args.generate_only:
-        model.eval()
-        prompt = cfg.prompt or "\n"
-        context = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
-        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            out = model.generate(
-                context,
-                max_new_tokens=cfg.sample_chars,
-                temperature=cfg.temperature,
-                top_k=cfg.top_k,
-                top_p=cfg.top_p,
-                repetition_penalty=cfg.repetition_penalty,
-            )[0].tolist()
-        _safe_print(tokenizer.decode(out))
+        if is_main_process:
+            model.eval()
+            prompt = cfg.prompt or "\n"
+            context = torch.tensor(
+                [tokenizer.encode(prompt)], dtype=torch.long, device=device
+            )
+            with torch.amp.autocast(
+                device_type=device.type, dtype=amp_dtype, enabled=use_amp
+            ):
+                out = model.generate(
+                    context,
+                    max_new_tokens=cfg.sample_chars,
+                    temperature=cfg.temperature,
+                    top_k=cfg.top_k,
+                    top_p=cfg.top_p,
+                    repetition_penalty=cfg.repetition_penalty,
+                )[0].tolist()
+            _safe_print(tokenizer.decode(out))
+
+        if ddp.enabled:
+            import torch.distributed as dist
+
+            dist.barrier()
+            dist.destroy_process_group()
         return
 
     if cfg.grad_accum_steps < 1:
@@ -1652,26 +1823,32 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             loss_sum = 0.0
-            for _ in range(cfg.grad_accum_steps):
-                x, y = _get_batch(
-                    train_data,
-                    batch_size=cfg.batch_size,
-                    block_size=cfg.block_size,
-                    device=device,
+            for micro_step in range(cfg.grad_accum_steps):
+                sync_ctx = (
+                    model_train.no_sync()
+                    if ddp.enabled and micro_step < (cfg.grad_accum_steps - 1)
+                    else nullcontext()
                 )
+                with sync_ctx:
+                    x, y = _get_batch(
+                        train_data,
+                        batch_size=cfg.batch_size,
+                        block_size=cfg.block_size,
+                        device=device,
+                    )
 
-                with torch.amp.autocast(
-                    device_type=device.type, dtype=amp_dtype, enabled=use_amp
-                ):
-                    _, loss = model_fwd(x, y)
+                    with torch.amp.autocast(
+                        device_type=device.type, dtype=amp_dtype, enabled=use_amp
+                    ):
+                        _, loss = model_fwd(x, y)
 
-                loss_sum += float(loss.item())
-                loss = loss / cfg.grad_accum_steps
+                    loss_sum += float(loss.item())
+                    loss = loss / cfg.grad_accum_steps
 
-                if scaler.is_enabled():
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                    if scaler.is_enabled():
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
             if cfg.grad_clip and cfg.grad_clip > 0:
                 if scaler.is_enabled():
@@ -1687,13 +1864,21 @@ def main() -> None:
             last_step = step + 1
             avg_loss = loss_sum / cfg.grad_accum_steps
 
-            if cfg.log_interval > 0 and (step + 1) % cfg.log_interval == 0:
+            if (
+                is_main_process
+                and cfg.log_interval > 0
+                and (step + 1) % cfg.log_interval == 0
+            ):
                 now = time.time()
                 steps = step + 1 - last_log_step
                 elapsed = now - last_log_time
                 steps_per_sec = steps / max(elapsed, 1e-8)
                 toks_per_sec = (
-                    steps_per_sec * cfg.batch_size * cfg.block_size * cfg.grad_accum_steps
+                    steps_per_sec
+                    * cfg.batch_size
+                    * cfg.block_size
+                    * cfg.grad_accum_steps
+                    * (ddp.world_size if ddp.enabled else 1)
                 )
                 print(
                     f"step {step+1:>6} | loss {avg_loss:.4f} | lr {lr:.2e} | {steps_per_sec:.2f} steps/s | {toks_per_sec/1000:.1f}k tok/s"
@@ -1706,74 +1891,87 @@ def main() -> None:
                 and cfg.eval_iters > 0
                 and ((step + 1) % cfg.eval_interval == 0 or step == start_step)
             ):
-                losses = _estimate_loss(
-                    model_fwd,
-                    train_data=train_data,
-                    val_data=val_data,
-                    cfg=cfg,
-                    device=device,
-                    use_amp=use_amp,
-                    amp_dtype=amp_dtype,
-                )
-                print(
-                    f"eval @ step {step+1:>6} | train {losses['train']:.4f} | val {losses['val']:.4f}"
-                )
-
-                if losses["val"] < best_val:
-                    best_val = losses["val"]
-                    torch.save(
-                        _build_checkpoint(
-                            model=model,
-                            optimizer=optimizer,
-                            step=step + 1,
-                            best_val=best_val,
-                            tokenizer=tokenizer,
-                            cfg=cfg,
-                        ),
-                        ckpt_best_path,
+                if is_main_process:
+                    losses = _estimate_loss(
+                        model_fwd,
+                        train_data=train_data,
+                        val_data=val_data,
+                        cfg=cfg,
+                        device=device,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
                     )
-                    print(f"saved best checkpoint to {ckpt_best_path}")
+                    print(
+                        f"eval @ step {step+1:>6} | train {losses['train']:.4f} | val {losses['val']:.4f}"
+                    )
+
+                    if losses["val"] < best_val:
+                        best_val = losses["val"]
+                        torch.save(
+                            _build_checkpoint(
+                                model=model,
+                                optimizer=optimizer,
+                                step=step + 1,
+                                best_val=best_val,
+                                tokenizer=tokenizer,
+                                cfg=cfg,
+                            ),
+                            ckpt_best_path,
+                        )
+                        print(f"saved best checkpoint to {ckpt_best_path}")
+
+                if ddp.enabled:
+                    dist.barrier()
 
             if cfg.sample_interval > 0 and (step + 1) % cfg.sample_interval == 0:
-                model.eval()
-                model_fwd.eval()
-                prompt = cfg.prompt or "\n"
-                context = torch.tensor(
-                    [tokenizer.encode(prompt)], dtype=torch.long, device=device
-                )
-                with torch.amp.autocast(
-                    device_type=device.type, dtype=amp_dtype, enabled=use_amp
-                ):
-                    out = model.generate(
-                        context,
-                        max_new_tokens=cfg.sample_chars,
-                        temperature=cfg.temperature,
-                        top_k=cfg.top_k,
-                        top_p=cfg.top_p,
-                        repetition_penalty=cfg.repetition_penalty,
-                    )[0].tolist()
-                model.train()
-                model_fwd.train()
-                print("--- sample ---")
-                _safe_print(tokenizer.decode(out))
-                print("--------------")
+                if is_main_process:
+                    model_train.eval()
+                    model_fwd.eval()
+                    prompt = cfg.prompt or "\n"
+                    context = torch.tensor(
+                        [tokenizer.encode(prompt)], dtype=torch.long, device=device
+                    )
+                    with torch.amp.autocast(
+                        device_type=device.type, dtype=amp_dtype, enabled=use_amp
+                    ):
+                        out = model.generate(
+                            context,
+                            max_new_tokens=cfg.sample_chars,
+                            temperature=cfg.temperature,
+                            top_k=cfg.top_k,
+                            top_p=cfg.top_p,
+                            repetition_penalty=cfg.repetition_penalty,
+                        )[0].tolist()
+                    model_train.train()
+                    model_fwd.train()
+                    print("--- sample ---")
+                    _safe_print(tokenizer.decode(out))
+                    print("--------------")
+
+                if ddp.enabled:
+                    dist.barrier()
     except KeyboardInterrupt:
         print("interrupted; saving latest checkpoint...")
     finally:
         if last_step > start_step:
             assert optimizer is not None
-            torch.save(
-                _build_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    step=last_step,
-                    best_val=best_val,
-                    tokenizer=tokenizer,
-                    cfg=cfg,
-                ),
-                ckpt_path,
-            )
-            print(f"saved checkpoint to {ckpt_path}")
+            if is_main_process:
+                torch.save(
+                    _build_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        step=last_step,
+                        best_val=best_val,
+                        tokenizer=tokenizer,
+                        cfg=cfg,
+                    ),
+                    ckpt_path,
+                )
+                print(f"saved checkpoint to {ckpt_path}")
+
+        if ddp.enabled:
+            dist.barrier()
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

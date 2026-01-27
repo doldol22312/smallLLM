@@ -212,6 +212,14 @@ class TinyLLMGUI:
         self.add_check(perf_group, "Compile fullgraph", "compile_fullgraph", False, 4)
         self.add_option(perf_group, "Compile dynamic:", "compile_dynamic", ["auto", "true", "false"], 5)
 
+        dist_group = ttk.LabelFrame(scroll, text="Distributed (DDP)")
+        dist_group.pack(fill="x", pady=5)
+        self.add_check(dist_group, "Enable DDP (torchrun)", "ddp", False, 0)
+        self.add_entry(dist_group, "Processes / GPUs:", "ddp_nproc", "1", 1)
+        self.add_option(dist_group, "DDP backend:", "ddp_backend", ["auto", "nccl", "gloo"], 2)
+        self.add_check(dist_group, "find_unused_parameters", "ddp_find_unused_parameters", False, 3)
+        self.add_entry(dist_group, "DDP timeout (s):", "ddp_timeout", "1800", 4)
+
         btn_train = ttk.Button(scroll, text="Start Training", command=self.start_training)
         btn_train.pack(fill="x", pady=10)
 
@@ -330,8 +338,26 @@ class TinyLLMGUI:
     def start_training(self):
         if self.is_running:
             return
-        
-        cmd = [sys.executable, "train_tinyllm.py"]
+
+        ddp_enabled = False
+        try:
+            ddp_enabled = self.vars["ddp"].get() and int(self.vars["ddp_nproc"].get()) > 1
+        except Exception:
+            ddp_enabled = False
+
+        if ddp_enabled:
+            cmd = [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nproc_per_node",
+                str(int(self.vars["ddp_nproc"].get())),
+                "train_tinyllm.py",
+                "--ddp",
+            ]
+        else:
+            cmd = [sys.executable, "train_tinyllm.py"]
 
         config_path = self.vars.get("config_path")
         if config_path and config_path.get().strip():
@@ -348,6 +374,14 @@ class TinyLLMGUI:
         seed = self.vars["seed"].get().strip()
         if seed:
             cmd.extend(["--seed", seed])
+
+        if ddp_enabled:
+            cmd.extend(["--ddp_backend", self.vars["ddp_backend"].get()])
+            if self.vars["ddp_find_unused_parameters"].get():
+                cmd.append("--ddp_find_unused_parameters")
+            else:
+                cmd.append("--no-ddp_find_unused_parameters")
+            cmd.extend(["--ddp_timeout", self.vars["ddp_timeout"].get()])
 
         cmd.extend(["--tokenizer", self.vars["tokenizer"].get()])
         if self.vars["tokenizer"].get() == "bpe":
@@ -450,7 +484,7 @@ class TinyLLMGUI:
     def run_command(self, cmd):
         self.is_running = True
         self.stop_btn.config(state="normal")
-        self.log(f"Running: {" ".join(cmd)}\n\n")
+        self.log(f"Running: {' '.join(cmd)}\n\n")
         
         def target():
             try:
