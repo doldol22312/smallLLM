@@ -1,141 +1,226 @@
-# Tiny LLM (Character-Level) Training
+***
 
-This repo trains a **tiny GPT-style Transformer** that predicts the next **character** in a text file.
+# 🧠 TinyGPT
 
-## GUI Interface
+<div align="center">
 
-You can use the graphical interface to configure training and generation:
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C.svg?style=for-the-badge&logo=pytorch)](https://pytorch.org/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg?style=for-the-badge&logo=python)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
 
+**A minimal, single-file implementation of a GPT-style language model trainer in PyTorch.**
+<br>
+*Designed for learning, experimentation, and training small language models on custom datasets.*
+
+[Features](#-features) • [Quick Start](#-quick-start) • [Configuration](#-configuration) • [Examples](#-examples)
+
+</div>
+
+---
+
+## ✨ Features
+
+TinyGPT is packed with modern LLM features despite its small footprint.
+
+| Category | Features |
+| :--- | :--- |
+| **🧠 Architecture** | • **Configurable Transformer:** Adjustable layers, heads, and dimensions.<br>• **Norms:** LayerNorm or RMSNorm.<br>• **Activations:** GELU or SwiGLU.<br>• **Positional:** Learned embeddings or RoPE (Rotary).<br>• **Attention:** Sliding window, QK Norm, Parallel Blocks. |
+| **🚂 Training** | • **Precision:** AMP (Automatic Mixed Precision) with BF16/FP16.<br>• **Optimizers:** AdamW, **8-bit AdamW** (bitsandbytes), Lion.<br>• **Scheduling:** Cosine, WSD (Warmup-Stable-Decay), Constant.<br>• **Regularization:** Dropout, label smoothing, z-loss, grad clipping. |
+| **⚡ Efficiency** | • **torch.compile:** Full JIT compilation support.<br>• **Grad Checkpointing:** Trade compute for VRAM.<br>• **DDP:** Multi-GPU Distributed Data Parallel training.<br>• **Weight Tying:** Option to tie embedding and output weights. |
+| **🔡 Tokenization** | • **Character-level:** Zero dependencies, simple.<br>• **BPE:** Byte-level BPE via HuggingFace tokenizers. |
+| **🤖 Generation** | • **KV-Cache:** Fast autoregressive generation.<br>• **Sampling:** Temp, Top-k, Top-p (Nucleus), Repetition Penalty. |
+
+---
+
+## 🚀 Quick Start
+
+### 1. Installation
+Requires Python 3.10+ and PyTorch 2.0+.
 ```bash
-python gui.py
+# Core dependencies
+pip install torch
+
+# Optional (for BPE and 8-bit optimizers)
+pip install tokenizers bitsandbytes
 ```
 
-The GUI allows you to:
-- Pick data files and output directories.
-- Configure model architecture and training hyperparameters.
-- Monitor training progress in real-time.
-- Generate text from trained models with a simple interface.
-
-## Quickstart
-
-Train on the included corpus:
-
+### 2. Prepare Data
+Download a text file to train on (e.g., a book from Gutenberg).
 ```bash
-python train_tinyllm.py
+curl -o data/tiny_corpus.txt https://www.gutenberg.org/files/1342/1342-0.txt
 ```
 
-The default settings come from `config/tiny_char_gpt.json` and the dataset is `data/tiny_corpus.txt`.
-Checkpoints and configs are written to `out/tiny_char_gpt/`.
-
-## Faster Smoke Test
-
+### 3. Train
+Train a simple character-level model.
 ```bash
-python train_tinyllm.py --out_dir out/smoke --max_steps 50 --n_layer 2 --n_head 2 --n_embd 64 --block_size 64 --batch_size 16
+python train_tinyllm.py --data_path data/tiny_corpus.txt --out_dir out/my_model
 ```
 
-## BPE Tokenizer (Better Text)
-
-Character-level models learn slowly; a **BPE tokenizer** usually gives more coherent output.
-
-Train with BPE (requires the `tokenizers` package):
-
+### 4. Generate
+Run inference using your trained model.
 ```bash
-pip install tokenizers
-python train_tinyllm.py --tokenizer bpe --bpe_vocab_size 8000 --data_path data/wikitext2.txt --out_dir out/wikitext2_bpe
+python train_tinyllm.py --generate_only --out_dir out/my_model --prompt "Once upon a time"
 ```
 
-This writes `tokenizer.json` into the `out_dir` (and also stores it inside the checkpoint).
+---
 
-## Clean WikiText (Recommended)
+## 📖 Usage & Arguments
 
-WikiText raw contains markup tokens like `@-@` and headings like `== Title ==`. Clean it first:
+You can run `train_tinyllm.py` with command-line arguments or a config file.
 
+### 💾 Data & I/O
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--data_path` | `data/tiny_corpus.txt` | Path to training text file. |
+| `--out_dir` | `out/tiny_char_gpt` | Output directory for checkpoints. |
+| `--resume` | `False` | Resume training from latest checkpoint. |
+| `--memmap_dataset` | `False` | Memory-map tokenized data (saves RAM). |
+
+### 🧮 Model Architecture
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--n_layer` | `4` | Number of transformer layers. |
+| `--n_head` | `4` | Number of attention heads. |
+| `--n_embd` | `128` | Embedding dimension. |
+| `--block_size` | `128` | Max sequence length (context window). |
+| `--norm` | `layernorm` | `layernorm` or `rmsnorm`. |
+| `--mlp` | `gelu` | `gelu` or `swiglu`. |
+| `--pos_encoding` | `learned` | `learned` or `rope`. |
+
+### ⚙️ Training Configuration
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--max_steps` | `2000` | Total training steps. |
+| `--batch_size` | `64` | Batch size per device. |
+| `--learning_rate` | `3e-4` | Peak learning rate. |
+| `--optimizer` | `adamw` | `adamw`, `adamw8bit`, or `lion`. |
+| `--amp` | `True` | Enable Mixed Precision. |
+| `--compile` | `False` | Enable `torch.compile` (faster). |
+
+*(See `--help` for the full list including dropout, gradient accumulation, and schedulers).*
+
+---
+
+## 🔧 Examples
+
+### 📄 JSON Configuration
+Instead of long CLI commands, use a JSON config:
+```json
+{
+  "data_path": "data/shakespeare.txt",
+  "out_dir": "out/shakespeare_gpt",
+  "tokenizer": "char",
+  "n_layer": 6,
+  "n_head": 6,
+  "n_embd": 384,
+  "compile": true,
+  "amp": true
+}
+```
+Run it:
 ```bash
-python prepare_wikitext.py --input data/wiki.train.TXT --output data/wiki.clean.txt
+python train_tinyllm.py --config config/my_config.json
 ```
 
-Then train on `data/wiki.clean.txt`.
-
-### Speed Tips (RTX 4060)
-
-- Use `--amp` (mixed precision) for a big speedup on CUDA.
-- Try `--compile` (PyTorch 2.x) for extra speed after the first-step compile overhead. If `inductor` fails with a Triton error on Windows, use `--compile_backend aot_eager` (or install a working `triton`).
-- If you’re memory-bound, try `--optimizer adamw8bit` (requires `bitsandbytes`, CUDA-only).
-- If you run out of VRAM, try `--grad_checkpointing` (slower, but uses less memory).
-- For large datasets, use `--memmap_dataset` to tokenize once into `out_dir/tokens.bin` and stream batches without loading all tokens into RAM/VRAM.
-- If your GPU is underutilized, try `--dataloader_workers 2` (or 4) to sample batches in parallel (works best with `--memmap_dataset`).
-- Reduce eval overhead while iterating: `--eval_interval 0 --sample_interval 0`.
-- Bigger `block_size` and bigger models get expensive fast; start smaller and scale up.
-- Learning rate uses warmup+cosine by default; try `--lr_schedule wsd --lr_stable_steps 2000` for warmup → stable → decay (tune `--lr_warmup_steps` / `--lr_min` too).
-- If you run out of VRAM, keep `--batch_size` small and use `--grad_accum_steps N` to get a larger effective batch.
-
-### Model Upgrades
-
-- `--weight_tying` ties embedding/output weights (fewer params).
-- `--mlp swiglu` uses SwiGLU MLPs (often better quality).
-- `--pos_encoding rope` uses rotary position embeddings (RoPE) instead of learned absolute embeddings.
-- `--norm rmsnorm` uses RMSNorm instead of LayerNorm (often a small win).
-- `--qk_norm` applies RMS normalization to Q/K (can help stability).
-- `--parallel_block` computes attention+MLP in parallel (parallel residual).
-- `--sliding_window 256` limits attention to the last N tokens.
-- `--layerdrop 0.1` randomly drops layers during training (regularization).
-
-### Training Extras
-
-- `--label_smoothing 0.1` (regularization)
-- `--z_loss 1e-4` (logit stabilization)
-- `--optimizer lion` (alternative optimizer)
-- `--ema --ema_decay 0.9999` (EMA weights for eval/sampling)
-- `--curriculum --curriculum_start_block_size 64 --curriculum_steps 5000` (sequence-length curriculum)
-
-## Distributed (Multi-GPU) Training (DDP)
-
-If you have multiple GPUs, launch with `torchrun` and enable DDP:
-
+### 🦙 Modern "Llama-style" Architecture
+Use RoPE, RMSNorm, and SwiGLU:
 ```bash
-torchrun --standalone --nproc_per_node=2 train_tinyllm.py --ddp --out_dir out/ddp_run --data_path data/wiki.clean.txt --tokenizer bpe --memmap_dataset --amp
+python train_tinyllm.py \
+  --pos_encoding rope \
+  --norm rmsnorm \
+  --mlp swiglu \
+  --qk_norm
 ```
 
-Notes:
-
-- `--batch_size` is **per GPU**. Effective batch is `batch_size * grad_accum_steps * world_size`.
-- Only rank 0 writes checkpoints/logs to `--out_dir`.
-- Backend defaults to `--ddp_backend auto` (NCCL on Linux+CUDA, otherwise Gloo).
-- If `torchrun` prints an `OMP_NUM_THREADS` warning, set it yourself before launching, e.g. `OMP_NUM_THREADS=1 torchrun ...`.
-- If you see noisy `[c10d] hostname ...` warnings in some notebook/container environments, it’s usually harmless (reverse DNS). You can silence C++ warnings with `TORCH_CPP_LOG_LEVEL=ERROR`.
-
-## Generate Text
-
-After training, sample from the latest checkpoint:
-
+### 🏎️ High-Performance BPE Training
+Use Byte-Pair Encoding, Compilation, and Memory Mapping for larger datasets:
 ```bash
-python train_tinyllm.py --out_dir out/tiny_char_gpt --generate_only --prompt "the cat " --sample_chars 300
+python train_tinyllm.py \
+  --data_path data/large_corpus.txt \
+  --tokenizer bpe --bpe_vocab_size 8000 \
+  --n_layer 8 --n_head 8 --n_embd 512 \
+  --memmap_dataset \
+  --compile --amp
 ```
 
-`--out_dir` must point at a folder that contains `ckpt.pt`. When generating/resuming, the script loads the
-model config + tokenizer from the checkpoint (so you don’t need to pass `--data_path`, and you can’t change
-shape-related flags like `--block_size` / `--n_embd` for that checkpoint).
-
-`ckpt.pt` is always written at the end of training (and on Ctrl+C). If eval is enabled, the best-so-far
-checkpoint is also saved as `ckpt_best.pt`.
-
-`--sample_chars` means “new tokens”: characters for `--tokenizer char`, tokens for `--tokenizer bpe`.
-
-Generation knobs:
-
-- `--top_p 0.9` (nucleus sampling)
-- `--repetition_penalty 1.1` (reduce loops)
-- `--kv_cache` (faster sampling)
-
-## Train On Your Own Text
-
-Put a UTF-8 text file anywhere and point the trainer at it:
-
+### 🌐 Multi-GPU (DDP)
 ```bash
-python train_tinyllm.py --data_path path/to/your.txt --out_dir out/my_run
+torchrun --standalone --nproc_per_node=2 train_tinyllm.py \
+  --data_path data/corpus.txt \
+  --ddp \
+  --batch_size 32 --grad_accum_steps 2
 ```
 
-## Notes
+---
 
-- This is intentionally small and simple; it’s meant for learning the workflow.
-- Because it’s character-level, output quality depends heavily on how much text you give it.
+## 📊 Logging & Artifacts
+
+The training loop provides real-time feedback:
+*   **Logs:** Loss & LR every `--log_interval`.
+*   **Eval:** Validation loss every `--eval_interval`.
+*   **Samples:** Text generation every `--sample_interval`.
+
+**Output Structure:**
+```text
+out/my_model/
+├── ckpt.pt              # Latest checkpoint
+├── ckpt_best.pt         # Best validation loss checkpoint
+├── effective_config.json # Full config used for training
+└── tokenizer.json       # BPE tokenizer data (if applicable)
+```
+
+---
+
+## 📐 Model Size Reference
+
+| Config | Params | VRAM (Train) | Use Case |
+| :--- | :--- | :--- | :--- |
+| **4L-4H-128E** | ~1M | <1GB | Quick CPU/Laptop experiments |
+| **6L-6H-384E** | ~10M | ~2GB | Small but capable char-level models |
+| **8L-8H-512E** | ~30M | ~4GB | Good for specialized BPE datasets |
+| **12L-12H-768E** | ~85M | ~8GB | GPT-2 Small scale |
+
+---
+
+## 🧩 Advanced Features
+
+<details>
+<summary><strong>Exponential Moving Average (EMA)</strong></summary>
+
+Maintains a moving average of model weights for potentially better generalization.
+```bash
+python train_tinyllm.py --ema --ema_decay 0.9999
+```
+</details>
+
+<details>
+<summary><strong>Curriculum Learning</strong></summary>
+
+Gradually increases the context length (block size) during training to speed up convergence.
+```bash
+python train_tinyllm.py --curriculum --curriculum_start_block_size 32
+```
+</details>
+
+<details>
+<summary><strong>Custom Generation Params</strong></summary>
+
+```bash
+python train_tinyllm.py \
+  --generate_only \
+  --prompt "The future of AI is" \
+  --temperature 0.8 --top_p 0.9 --kv_cache
+```
+</details>
+
+---
+
+## 🙏 Acknowledgments
+
+This project is intended for educational purposes. Inspiration drawn from:
+*   [nanoGPT](https://github.com/karpathy/nanoGPT) & [minGPT](https://github.com/karpathy/minGPT) by Andrej Karpathy.
+*   The Llama and GPT-2 architectural papers.
+
+## 📄 License
+
+[MIT License](LICENSE)
