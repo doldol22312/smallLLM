@@ -60,11 +60,13 @@ Then train on `data/wiki.clean.txt`.
 
 - Use `--amp` (mixed precision) for a big speedup on CUDA.
 - Try `--compile` (PyTorch 2.x) for extra speed after the first-step compile overhead. If `inductor` fails with a Triton error on Windows, use `--compile_backend aot_eager` (or install a working `triton`).
+- If you’re memory-bound, try `--optimizer adamw8bit` (requires `bitsandbytes`, CUDA-only).
 - If you run out of VRAM, try `--grad_checkpointing` (slower, but uses less memory).
 - For large datasets, use `--memmap_dataset` to tokenize once into `out_dir/tokens.bin` and stream batches without loading all tokens into RAM/VRAM.
+- If your GPU is underutilized, try `--dataloader_workers 2` (or 4) to sample batches in parallel (works best with `--memmap_dataset`).
 - Reduce eval overhead while iterating: `--eval_interval 0 --sample_interval 0`.
 - Bigger `block_size` and bigger models get expensive fast; start smaller and scale up.
-- Learning rate uses warmup+cosine by default; change with `--lr_schedule constant` (or tune `--lr_warmup_steps` / `--lr_min`).
+- Learning rate uses warmup+cosine by default; try `--lr_schedule wsd --lr_stable_steps 2000` for warmup → stable → decay (tune `--lr_warmup_steps` / `--lr_min` too).
 - If you run out of VRAM, keep `--batch_size` small and use `--grad_accum_steps N` to get a larger effective batch.
 
 ### Model Upgrades
@@ -83,6 +85,8 @@ Then train on `data/wiki.clean.txt`.
 - `--label_smoothing 0.1` (regularization)
 - `--z_loss 1e-4` (logit stabilization)
 - `--optimizer lion` (alternative optimizer)
+- `--ema --ema_decay 0.9999` (EMA weights for eval/sampling)
+- `--curriculum --curriculum_start_block_size 64 --curriculum_steps 5000` (sequence-length curriculum)
 
 ## Distributed (Multi-GPU) Training (DDP)
 

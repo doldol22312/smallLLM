@@ -34,12 +34,16 @@ class TrainConfig:
     max_steps: int = 2000
     batch_size: int = 64
     grad_accum_steps: int = 1
+    dataloader_workers: int = 0
+    dataloader_prefetch_factor: int = 2
+    dataloader_persistent_workers: bool = True
     block_size: int = 128
     learning_rate: float = 3e-4
-    lr_schedule: str = "cosine"  # constant|cosine
+    lr_schedule: str = "cosine"  # constant|cosine|wsd
     lr_warmup_steps: int = 200
+    lr_stable_steps: int = 0
     lr_min: float = 3e-5
-    optimizer: str = "adamw"  # adamw|lion
+    optimizer: str = "adamw"  # adamw|adamw8bit|lion
     lion_beta1: float = 0.9
     lion_beta2: float = 0.99
     weight_decay: float = 0.1
@@ -91,6 +95,15 @@ class TrainConfig:
     repetition_penalty: float = 1.0
     label_smoothing: float = 0.0
     z_loss: float = 0.0
+    ema: bool = False
+    ema_decay: float = 0.9999
+    ema_update_every: int = 1
+    ema_start_step: int = 0
+    use_ema: bool | None = None  # generation-only default: auto
+
+    curriculum: bool = False
+    curriculum_start_block_size: int = 32
+    curriculum_steps: int = 2000
 
 
 @dataclass(frozen=True)
@@ -167,6 +180,75 @@ class Lion(torch.optim.Optimizer):
                 m.mul_(beta2).add_(g, alpha=1.0 - beta2)
 
         return loss
+
+
+class EMA:
+    def __init__(self, model: nn.Module, *, decay: float):
+        if not 0.0 < decay < 1.0:
+            raise ValueError("decay must be in (0, 1)")
+        self.decay = float(decay)
+        self.shadow: dict[str, torch.Tensor] = {}
+        self._backup: dict[str, torch.Tensor] = {}
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            self.shadow[name] = param.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if name not in self.shadow:
+                continue
+            self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
+
+    def state_dict(self) -> dict:
+        return {
+            "decay": self.decay,
+            "shadow": {k: v.detach().cpu() for k, v in self.shadow.items()},
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        shadow = state.get("shadow")
+        if not isinstance(shadow, dict):
+            raise ValueError("EMA state_dict missing 'shadow'")
+        for name, tensor in shadow.items():
+            if name not in self.shadow:
+                continue
+            if not torch.is_tensor(tensor):
+                continue
+            self.shadow[name].copy_(
+                tensor.to(device=self.shadow[name].device, dtype=self.shadow[name].dtype)
+            )
+
+    def apply_to(self, model: nn.Module) -> None:
+        self._backup = {}
+        for name, param in model.named_parameters():
+            if name not in self.shadow:
+                continue
+            self._backup[name] = param.detach().clone()
+            param.data.copy_(
+                self.shadow[name].to(device=param.device, dtype=param.data.dtype)
+            )
+
+    def restore(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if name not in self._backup:
+                continue
+            param.data.copy_(self._backup[name].to(device=param.device, dtype=param.data.dtype))
+        self._backup = {}
+
+
+def _maybe_apply_ema_to_model(model: nn.Module, ema_state: dict) -> None:
+    shadow = ema_state.get("shadow")
+    if not isinstance(shadow, dict):
+        return
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            t = shadow.get(name)
+            if not torch.is_tensor(t):
+                continue
+            param.data.copy_(t.to(device=param.device, dtype=param.data.dtype))
 
 
 class CharTokenizer:
@@ -1054,6 +1136,100 @@ def _get_batch(
     return x, y
 
 
+class RandomBatchIterableDataset(torch.utils.data.IterableDataset):
+    def __init__(
+        self,
+        *,
+        data: torch.Tensor | None = None,
+        memmap_path: str | None = None,
+        memmap_dtype: torch.dtype | None = None,
+        memmap_size: int | None = None,
+        start: int = 0,
+        end: int | None = None,
+        batch_size: int,
+        block_size: int,
+        seed: int,
+    ):
+        super().__init__()
+        self.data = data
+        self.memmap_path = memmap_path
+        self.memmap_dtype = memmap_dtype
+        self.memmap_size = memmap_size
+        self.start = int(start)
+        self.end = int(end) if end is not None else None
+        self.batch_size = int(batch_size)
+        self.block_size = int(block_size)
+        self.seed = int(seed)
+
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if self.block_size < 1:
+            raise ValueError("block_size must be >= 1")
+        if self.data is None:
+            if not self.memmap_path:
+                raise ValueError("Either data or memmap_path must be provided")
+            if self.memmap_dtype is None or self.memmap_size is None:
+                raise ValueError("memmap_dtype and memmap_size are required for memmap_path")
+
+    def _open_data(self) -> torch.Tensor:
+        if self.data is not None:
+            return self.data
+        assert self.memmap_path is not None
+        assert self.memmap_dtype is not None
+        assert self.memmap_size is not None
+        return torch.from_file(
+            self.memmap_path,
+            dtype=self.memmap_dtype,
+            size=int(self.memmap_size),
+        )
+
+    def __iter__(self):
+        from torch.utils.data import get_worker_info
+
+        worker = get_worker_info()
+        worker_id = int(worker.id) if worker is not None else 0
+
+        gen = torch.Generator()
+        gen.manual_seed(self.seed + 1000 * worker_id)
+
+        data = self._open_data()
+        if data.device.type != "cpu":
+            raise RuntimeError("RandomBatchIterableDataset expects CPU token data")
+
+        end = int(self.end) if self.end is not None else int(data.size(0))
+        data = data[self.start : end]
+
+        max_start = int(data.size(0)) - self.block_size - 1
+        if max_start <= 0:
+            raise ValueError("Dataset is too small for the requested block_size")
+
+        offsets = torch.arange(self.block_size, dtype=torch.long)
+        while True:
+            starts = torch.randint(0, max_start, (self.batch_size,), generator=gen)
+            idx = starts[:, None] + offsets[None, :]
+            x = data[idx]
+            y = data[idx + 1]
+            yield x, y
+
+
+def _maybe_to_device(
+    x: torch.Tensor, y: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.device != device:
+        if x.device.type == "cpu" and device.type == "cuda":
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+        else:
+            x = x.to(device)
+            y = y.to(device)
+
+    if x.dtype != torch.long:
+        x = x.long()
+    if y.dtype != torch.long:
+        y = y.long()
+    return x, y
+
+
 @torch.no_grad()
 def _estimate_loss(
     model: TinyGPT,
@@ -1116,12 +1292,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--grad_accum_steps", type=int, default=None)
+    parser.add_argument("--dataloader_workers", type=int, default=None)
+    parser.add_argument("--dataloader_prefetch_factor", type=int, default=None)
+    parser.add_argument(
+        "--dataloader_persistent_workers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Keep DataLoader workers alive between iterations (only when dataloader_workers > 0).",
+    )
     parser.add_argument("--block_size", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
-    parser.add_argument("--lr_schedule", default=None, choices=["constant", "cosine"])
+    parser.add_argument("--lr_schedule", default=None, choices=["constant", "cosine", "wsd"])
     parser.add_argument("--lr_warmup_steps", type=int, default=None)
+    parser.add_argument("--lr_stable_steps", type=int, default=None)
     parser.add_argument("--lr_min", type=float, default=None)
-    parser.add_argument("--optimizer", default=None, choices=["adamw", "lion"])
+    parser.add_argument("--optimizer", default=None, choices=["adamw", "adamw8bit", "lion"])
     parser.add_argument("--lion_beta1", type=float, default=None)
     parser.add_argument("--lion_beta2", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
@@ -1134,6 +1319,30 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--label_smoothing", type=float, default=None)
     parser.add_argument("--z_loss", type=float, default=None)
+    parser.add_argument(
+        "--ema",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Track an exponential moving average of weights (EMA) and use it for eval/sampling.",
+    )
+    parser.add_argument("--ema_decay", type=float, default=None)
+    parser.add_argument("--ema_update_every", type=int, default=None)
+    parser.add_argument("--ema_start_step", type=int, default=None)
+    parser.add_argument(
+        "--use_ema",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="When generating, use EMA weights if present in checkpoint (default: auto).",
+    )
+
+    parser.add_argument(
+        "--curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable a simple sequence-length curriculum (ramps block_size over time).",
+    )
+    parser.add_argument("--curriculum_start_block_size", type=int, default=None)
+    parser.add_argument("--curriculum_steps", type=int, default=None)
 
     parser.add_argument(
         "--compile",
@@ -1332,19 +1541,53 @@ def _build_optim_groups(model: nn.Module, weight_decay: float) -> list[dict]:
 def _get_lr(step: int, cfg: TrainConfig) -> float:
     if cfg.lr_schedule == "constant":
         return cfg.learning_rate
-    if cfg.lr_schedule != "cosine":
-        raise ValueError(f"Unknown lr_schedule: {cfg.lr_schedule!r}")
+    if cfg.lr_schedule == "cosine":
+        if cfg.lr_warmup_steps > 0 and step < cfg.lr_warmup_steps:
+            return cfg.learning_rate * float(step + 1) / float(cfg.lr_warmup_steps)
 
-    if cfg.lr_warmup_steps > 0 and step < cfg.lr_warmup_steps:
-        return cfg.learning_rate * float(step + 1) / float(cfg.lr_warmup_steps)
+        if cfg.max_steps <= cfg.lr_warmup_steps:
+            return cfg.lr_min
 
-    if cfg.max_steps <= cfg.lr_warmup_steps:
-        return cfg.lr_min
+        progress = float(step - cfg.lr_warmup_steps) / float(cfg.max_steps - cfg.lr_warmup_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return cfg.lr_min + (cfg.learning_rate - cfg.lr_min) * cosine
 
-    progress = float(step - cfg.lr_warmup_steps) / float(cfg.max_steps - cfg.lr_warmup_steps)
-    progress = min(max(progress, 0.0), 1.0)
-    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return cfg.lr_min + (cfg.learning_rate - cfg.lr_min) * cosine
+    if cfg.lr_schedule == "wsd":
+        warmup = int(cfg.lr_warmup_steps)
+        stable = int(cfg.lr_stable_steps)
+        stable_end = warmup + stable
+
+        if warmup > 0 and step < warmup:
+            return cfg.learning_rate * float(step + 1) / float(warmup)
+
+        if step < stable_end:
+            return cfg.learning_rate
+
+        decay_steps = int(cfg.max_steps) - stable_end
+        if decay_steps <= 0:
+            return cfg.learning_rate
+
+        progress = float(step - stable_end) / float(decay_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return cfg.lr_min + (cfg.learning_rate - cfg.lr_min) * cosine
+
+    raise ValueError(f"Unknown lr_schedule: {cfg.lr_schedule!r}")
+
+
+def _curriculum_block_size(step: int, cfg: TrainConfig) -> int:
+    if not cfg.curriculum:
+        return int(cfg.block_size)
+    start = int(min(cfg.curriculum_start_block_size, cfg.block_size))
+    total = int(cfg.curriculum_steps)
+    if total <= 1:
+        return int(cfg.block_size)
+    if step >= total:
+        return int(cfg.block_size)
+    frac = float(step + 1) / float(total)
+    bs = int(round(start + (int(cfg.block_size) - start) * frac))
+    return int(max(1, min(int(cfg.block_size), bs)))
 
 
 def _tokenizer_from_checkpoint(checkpoint: dict) -> CharTokenizer | BpeTokenizer:
@@ -1382,6 +1625,7 @@ def _build_checkpoint(
     best_val: float,
     tokenizer: CharTokenizer | BpeTokenizer,
     cfg: TrainConfig,
+    ema_state: dict | None = None,
 ) -> dict:
     ckpt = {
         "model_state": model.state_dict(),
@@ -1392,6 +1636,8 @@ def _build_checkpoint(
     }
     if optimizer is not None:
         ckpt["optim_state"] = optimizer.state_dict()
+    if ema_state is not None:
+        ckpt["ema_state"] = ema_state
     if cfg.tokenizer == "char":
         ckpt["itos"] = tokenizer.itos
     return ckpt
@@ -1419,10 +1665,14 @@ def main() -> None:
             "max_steps": args.max_steps,
             "batch_size": args.batch_size,
             "grad_accum_steps": args.grad_accum_steps,
+            "dataloader_workers": args.dataloader_workers,
+            "dataloader_prefetch_factor": args.dataloader_prefetch_factor,
+            "dataloader_persistent_workers": args.dataloader_persistent_workers,
             "block_size": args.block_size,
             "learning_rate": args.learning_rate,
             "lr_schedule": args.lr_schedule,
             "lr_warmup_steps": args.lr_warmup_steps,
+            "lr_stable_steps": args.lr_stable_steps,
             "lr_min": args.lr_min,
             "optimizer": args.optimizer,
             "lion_beta1": args.lion_beta1,
@@ -1438,6 +1688,14 @@ def main() -> None:
             "amp": args.amp,
             "label_smoothing": args.label_smoothing,
             "z_loss": args.z_loss,
+            "ema": args.ema,
+            "ema_decay": args.ema_decay,
+            "ema_update_every": args.ema_update_every,
+            "ema_start_step": args.ema_start_step,
+            "use_ema": args.use_ema,
+            "curriculum": args.curriculum,
+            "curriculum_start_block_size": args.curriculum_start_block_size,
+            "curriculum_steps": args.curriculum_steps,
             "eval_interval": args.eval_interval,
             "eval_iters": args.eval_iters,
             "log_interval": args.log_interval,
@@ -1529,9 +1787,13 @@ def main() -> None:
                     "max_steps": args.max_steps,
                     "batch_size": args.batch_size,
                     "grad_accum_steps": args.grad_accum_steps,
+                    "dataloader_workers": args.dataloader_workers,
+                    "dataloader_prefetch_factor": args.dataloader_prefetch_factor,
+                    "dataloader_persistent_workers": args.dataloader_persistent_workers,
                     "learning_rate": args.learning_rate,
                     "lr_schedule": args.lr_schedule,
                     "lr_warmup_steps": args.lr_warmup_steps,
+                    "lr_stable_steps": args.lr_stable_steps,
                     "lr_min": args.lr_min,
                     "memmap_dataset": args.memmap_dataset,
                     "optimizer": args.optimizer,
@@ -1548,6 +1810,14 @@ def main() -> None:
                     "amp": args.amp,
                     "label_smoothing": args.label_smoothing,
                     "z_loss": args.z_loss,
+                    "ema": args.ema,
+                    "ema_decay": args.ema_decay,
+                    "ema_update_every": args.ema_update_every,
+                    "ema_start_step": args.ema_start_step,
+                    "use_ema": args.use_ema,
+                    "curriculum": args.curriculum,
+                    "curriculum_start_block_size": args.curriculum_start_block_size,
+                    "curriculum_steps": args.curriculum_steps,
                     "eval_interval": args.eval_interval,
                     "eval_iters": args.eval_iters,
                     "log_interval": args.log_interval,
@@ -1587,6 +1857,27 @@ def main() -> None:
         raise ValueError("--z_loss must be >= 0")
     if cfg.layerdrop < 0 or cfg.layerdrop >= 1:
         raise ValueError("--layerdrop must be in [0, 1)")
+    if cfg.dataloader_workers < 0:
+        raise ValueError("--dataloader_workers must be >= 0")
+    if cfg.dataloader_prefetch_factor < 1:
+        raise ValueError("--dataloader_prefetch_factor must be >= 1")
+    if cfg.lr_warmup_steps < 0:
+        raise ValueError("--lr_warmup_steps must be >= 0")
+    if cfg.lr_stable_steps < 0:
+        raise ValueError("--lr_stable_steps must be >= 0")
+    if cfg.ema_decay <= 0 or cfg.ema_decay >= 1:
+        raise ValueError("--ema_decay must be in (0, 1)")
+    if cfg.ema_update_every < 1:
+        raise ValueError("--ema_update_every must be >= 1")
+    if cfg.ema_start_step < 0:
+        raise ValueError("--ema_start_step must be >= 0")
+    if cfg.curriculum:
+        if cfg.curriculum_start_block_size < 1:
+            raise ValueError("--curriculum_start_block_size must be >= 1")
+        if cfg.curriculum_steps < 1:
+            raise ValueError("--curriculum_steps must be >= 1")
+        if cfg.curriculum_start_block_size > cfg.block_size:
+            raise ValueError("--curriculum_start_block_size must be <= --block_size")
 
     device_str = _device_from_cfg(cfg.device)
     ddp = _init_ddp(cfg=cfg, device_str=device_str)
@@ -1697,8 +1988,15 @@ def main() -> None:
 
             data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
             split_idx = int(0.9 * data.size(0))
-            train_data = data[:split_idx].to(device)
-            val_data = data[split_idx:].to(device)
+            train_data = data[:split_idx]
+            val_data = data[split_idx:]
+            if (
+                cfg.dataloader_workers <= 0
+                and device.type == "cuda"
+                and not cfg.memmap_dataset
+            ):
+                train_data = train_data.to(device)
+                val_data = val_data.to(device)
 
     model = TinyGPT(vocab_size=tokenizer.vocab_size, cfg=cfg)
     start_step = 0
@@ -1740,6 +2038,20 @@ def main() -> None:
                 lr=cfg.learning_rate,
                 betas=(0.9, 0.95),
             )
+        elif cfg.optimizer == "adamw8bit":
+            if device.type != "cuda":
+                raise ValueError("--optimizer adamw8bit requires CUDA")
+            try:
+                import bitsandbytes as bnb
+            except ModuleNotFoundError as e:
+                raise ModuleNotFoundError(
+                    "8-bit AdamW requires `bitsandbytes`. Install with: pip install bitsandbytes"
+                ) from e
+            optimizer = bnb.optim.AdamW8bit(
+                optim_groups,
+                lr=cfg.learning_rate,
+                betas=(0.9, 0.95),
+            )
         elif cfg.optimizer == "lion":
             optimizer = Lion(
                 optim_groups,
@@ -1757,6 +2069,15 @@ def main() -> None:
         scaler = torch.amp.GradScaler(
             device=device.type, enabled=use_amp and amp_dtype == torch.float16
         )
+
+    ema: EMA | None = None
+    if not args.generate_only and cfg.ema and is_main_process:
+        ema = EMA(model, decay=cfg.ema_decay)
+        if checkpoint is not None and isinstance(checkpoint, dict) and "ema_state" in checkpoint:
+            try:
+                ema.load_state_dict(checkpoint["ema_state"])
+            except Exception as e:
+                print(f"warning: EMA state not loaded ({e}); starting fresh EMA.")
 
     model_fwd: nn.Module = model_train
     if not args.generate_only and cfg.compile:
@@ -1807,6 +2128,19 @@ def main() -> None:
 
     if args.generate_only:
         if is_main_process:
+            use_ema = (
+                cfg.use_ema
+                if cfg.use_ema is not None
+                else (checkpoint is not None and isinstance(checkpoint, dict) and "ema_state" in checkpoint)
+            )
+            if (
+                use_ema
+                and checkpoint is not None
+                and isinstance(checkpoint, dict)
+                and "ema_state" in checkpoint
+            ):
+                _maybe_apply_ema_to_model(model, checkpoint["ema_state"])
+
             model.eval()
             prompt = cfg.prompt or "\n"
             context = torch.tensor(
@@ -1835,6 +2169,53 @@ def main() -> None:
     if cfg.grad_accum_steps < 1:
         raise ValueError("--grad_accum_steps must be >= 1")
 
+    train_batch_iter = None
+    if cfg.dataloader_workers > 0:
+        from torch.utils.data import DataLoader
+
+        if cfg.memmap_dataset:
+            bin_path, _ = _memmap_paths(cfg.out_dir)
+            _, memmap_dtype, _ = _memmap_dtype_for_vocab(tokenizer.vocab_size)
+            dataset = RandomBatchIterableDataset(
+                memmap_path=bin_path,
+                memmap_dtype=memmap_dtype,
+                memmap_size=int(data.size(0)),
+                start=0,
+                end=split_idx,
+                batch_size=cfg.batch_size,
+                block_size=cfg.block_size,
+                seed=seed,
+            )
+        else:
+            assert train_data is not None
+            if train_data.device.type != "cpu":
+                if is_main_process:
+                    print(
+                        "warning: --dataloader_workers expects CPU training data; moving train_data back to CPU."
+                    )
+                train_data = train_data.cpu()
+            dataset = RandomBatchIterableDataset(
+                data=train_data,
+                batch_size=cfg.batch_size,
+                block_size=cfg.block_size,
+                seed=seed,
+            )
+
+        loader_kwargs = {
+            "batch_size": None,
+            "num_workers": int(cfg.dataloader_workers),
+            "pin_memory": device.type == "cuda",
+            "prefetch_factor": int(cfg.dataloader_prefetch_factor),
+            "persistent_workers": bool(cfg.dataloader_persistent_workers),
+        }
+        train_loader = DataLoader(dataset, **loader_kwargs)
+        train_batch_iter = iter(train_loader)
+        if is_main_process:
+            print(
+                f"DataLoader: workers={cfg.dataloader_workers} pin_memory={device.type=='cuda'} "
+                f"prefetch_factor={cfg.dataloader_prefetch_factor} persistent={bool(cfg.dataloader_persistent_workers)}"
+            )
+
     last_log_time = time.time()
     last_log_step = start_step
     last_step = start_step
@@ -1845,6 +2226,7 @@ def main() -> None:
             assert optimizer is not None
             assert scaler is not None
             lr = _get_lr(step, cfg)
+            step_block_size = _curriculum_block_size(step, cfg)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
@@ -1857,12 +2239,19 @@ def main() -> None:
                     else nullcontext()
                 )
                 with sync_ctx:
-                    x, y = _get_batch(
-                        train_data,
-                        batch_size=cfg.batch_size,
-                        block_size=cfg.block_size,
-                        device=device,
-                    )
+                    if train_batch_iter is None:
+                        x, y = _get_batch(
+                            train_data,
+                            batch_size=cfg.batch_size,
+                            block_size=step_block_size,
+                            device=device,
+                        )
+                    else:
+                        x, y = next(train_batch_iter)
+                        if step_block_size != cfg.block_size:
+                            x = x[:, :step_block_size]
+                            y = y[:, :step_block_size]
+                        x, y = _maybe_to_device(x, y, device)
 
                     with torch.amp.autocast(
                         device_type=device.type, dtype=amp_dtype, enabled=use_amp
@@ -1889,6 +2278,12 @@ def main() -> None:
                 optimizer.step()
 
             last_step = step + 1
+            if ema is not None:
+                global_step = step + 1
+                if global_step > cfg.ema_start_step and (
+                    (global_step - cfg.ema_start_step) % cfg.ema_update_every == 0
+                ):
+                    ema.update(model)
             avg_loss = loss_sum / cfg.grad_accum_steps
 
             if (
@@ -1903,7 +2298,7 @@ def main() -> None:
                 toks_per_sec = (
                     steps_per_sec
                     * cfg.batch_size
-                    * cfg.block_size
+                    * step_block_size
                     * cfg.grad_accum_steps
                     * (ddp.world_size if ddp.enabled else 1)
                 )
@@ -1919,21 +2314,29 @@ def main() -> None:
                 and ((step + 1) % cfg.eval_interval == 0 or step == start_step)
             ):
                 if is_main_process:
-                    losses = _estimate_loss(
-                        model_fwd,
-                        train_data=train_data,
-                        val_data=val_data,
-                        cfg=cfg,
-                        device=device,
-                        use_amp=use_amp,
-                        amp_dtype=amp_dtype,
-                    )
+                    try:
+                        if ema is not None:
+                            ema.apply_to(model)
+                        losses = _estimate_loss(
+                            model_fwd,
+                            train_data=train_data,
+                            val_data=val_data,
+                            cfg=cfg,
+                            device=device,
+                            use_amp=use_amp,
+                            amp_dtype=amp_dtype,
+                        )
+                    finally:
+                        if ema is not None:
+                            ema.restore(model)
+
                     print(
                         f"eval @ step {step+1:>6} | train {losses['train']:.4f} | val {losses['val']:.4f}"
                     )
 
                     if losses["val"] < best_val:
                         best_val = losses["val"]
+                        ema_state = ema.state_dict() if ema is not None else None
                         torch.save(
                             _build_checkpoint(
                                 model=model,
@@ -1942,6 +2345,7 @@ def main() -> None:
                                 best_val=best_val,
                                 tokenizer=tokenizer,
                                 cfg=cfg,
+                                ema_state=ema_state,
                             ),
                             ckpt_best_path,
                         )
@@ -1952,25 +2356,32 @@ def main() -> None:
 
             if cfg.sample_interval > 0 and (step + 1) % cfg.sample_interval == 0:
                 if is_main_process:
-                    model_train.eval()
-                    model_fwd.eval()
-                    prompt = cfg.prompt or "\n"
-                    context = torch.tensor(
-                        [tokenizer.encode(prompt)], dtype=torch.long, device=device
-                    )
-                    with torch.amp.autocast(
-                        device_type=device.type, dtype=amp_dtype, enabled=use_amp
-                    ):
-                        out = model.generate(
-                            context,
-                            max_new_tokens=cfg.sample_chars,
-                            temperature=cfg.temperature,
-                            top_k=cfg.top_k,
-                            top_p=cfg.top_p,
-                            repetition_penalty=cfg.repetition_penalty,
-                        )[0].tolist()
-                    model_train.train()
-                    model_fwd.train()
+                    try:
+                        if ema is not None:
+                            ema.apply_to(model)
+                        model_train.eval()
+                        model_fwd.eval()
+                        prompt = cfg.prompt or "\n"
+                        context = torch.tensor(
+                            [tokenizer.encode(prompt)], dtype=torch.long, device=device
+                        )
+                        with torch.amp.autocast(
+                            device_type=device.type, dtype=amp_dtype, enabled=use_amp
+                        ):
+                            out = model.generate(
+                                context,
+                                max_new_tokens=cfg.sample_chars,
+                                temperature=cfg.temperature,
+                                top_k=cfg.top_k,
+                                top_p=cfg.top_p,
+                                repetition_penalty=cfg.repetition_penalty,
+                            )[0].tolist()
+                    finally:
+                        model_train.train()
+                        model_fwd.train()
+                        if ema is not None:
+                            ema.restore(model)
+
                     print("--- sample ---")
                     _safe_print(tokenizer.decode(out))
                     print("--------------")
@@ -1983,6 +2394,7 @@ def main() -> None:
         if last_step > start_step:
             assert optimizer is not None
             if is_main_process:
+                ema_state = ema.state_dict() if ema is not None else None
                 torch.save(
                     _build_checkpoint(
                         model=model,
@@ -1991,6 +2403,7 @@ def main() -> None:
                         best_val=best_val,
                         tokenizer=tokenizer,
                         cfg=cfg,
+                        ema_state=ema_state,
                     ),
                     ckpt_path,
                 )
