@@ -1,0 +1,89 @@
+Tiny LLM training corpus
+========================
+
+This is a small, intentionally simple text dataset.
+It exists so you can train a miniature language model locally without downloading anything.
+
+The goal is not to build a state-of-the-art model.
+The goal is to learn the workflow: tokenize text, train a Transformer, save a checkpoint, and generate samples.
+
+---
+
+In a quiet workshop, a tiny model learns patterns.
+It reads characters from a file and tries to guess the next one.
+At first it guesses poorly.
+After many steps it starts to mimic the style of the corpus.
+
+The model sees sequences like:
+"the cat sat on the mat"
+"the cat sat on the hat"
+"the cat sat and looked at the mat"
+
+It learns that "the " often comes before "cat".
+It learns that spaces and newlines matter.
+It learns that punctuation ends sentences.
+
+---
+
+Example dialogue:
+
+User: write a short function.
+Assistant: def add(a, b):
+Assistant:     return a + b
+
+User: explain it.
+Assistant: It takes two numbers and returns their sum.
+
+---
+
+Notes about training:
+
+- A character-level model has a small vocabulary (just the unique characters in the file).
+- It is easy to train but it generates character-by-character.
+- A token-level model (BPE) is better, but requires a tokenizer.
+
+---
+
+Some short poems:
+
+Light on keys and lines of code,
+small mistakes on every road,
+learn the loss, adjust the weight,
+step by step, we iterate.
+
+---
+
+Technical phrases (for variety):
+
+gradient descent, attention, layer norm, residual connection, logits, cross entropy
+batch size, learning rate, warmup, decay, checkpoint, seed, reproducibility
+
+---
+
+Repetition helps a tiny model learn quickly:
+
+the cat sat on the mat.
+the cat sat on the mat.
+the cat sat on the mat.
+the cat sat on the mat.
+the cat sat on the mat.
+the cat sat on the mat.
+
+the dog ran to the log.
+the dog ran to the log.
+the dog ran to the log.
+the dog ran to the log.
+the dog ran to the log.
+
+---
+
+Mini story:
+
+Once, a curious bot tried to finish a sentence.
+It looked at the context window and found only a few tokens.
+Still, it tried.
+It guessed, it learned, and it tried again.
+Eventually it produced something that sounded like the training text.
+
+The end.
+
