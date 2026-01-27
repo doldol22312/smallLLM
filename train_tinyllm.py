@@ -205,7 +205,7 @@ class BpeTokenizer:
             files=[data_path],
             vocab_size=vocab_size,
             min_frequency=min_frequency,
-            show_progress=False,
+            show_progress=True,
         )
         return cls(bpe._tokenizer)
 
