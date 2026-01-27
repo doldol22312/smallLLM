@@ -488,12 +488,18 @@ class TinyLLMGUI:
         
         def target():
             try:
+                env = os.environ.copy()
+                if "torch.distributed.run" in cmd and "OMP_NUM_THREADS" not in env:
+                    # Prevent torchrun from spamming its default OMP_NUM_THREADS warning.
+                    env["OMP_NUM_THREADS"] = "1"
+
                 # Use creationflags to prevent terminal window popup on Windows if desired
                 # but for now we want to see it or just pipe it.
                 self.process = subprocess.Popen(
                     cmd, 
                     stdout=subprocess.PIPE, 
                     stderr=subprocess.STDOUT, 
+                    env=env,
                     text=True,
                     encoding="utf-8",
                     errors="replace",

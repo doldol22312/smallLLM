@@ -1,6 +1,7 @@
 import argparse
 import json
 import hashlib
+import inspect
 import math
 import os
 import random
@@ -980,9 +981,21 @@ def _init_ddp(*, cfg: TrainConfig, device_str: str) -> DdpInfo:
     if device_str == "cuda":
         torch.cuda.set_device(local_rank)
 
-    dist.init_process_group(
-        backend=backend, init_method="env://", timeout=timedelta(seconds=int(cfg.ddp_timeout))
+    init_kwargs = dict(
+        backend=backend,
+        init_method="env://",
+        timeout=timedelta(seconds=int(cfg.ddp_timeout)),
     )
+    if backend == "nccl" and device_str == "cuda":
+        # Newer PyTorch versions accept device_id=..., which avoids NCCL "unknown device" warnings.
+        try:
+            sig = inspect.signature(dist.init_process_group)
+            if "device_id" in sig.parameters:
+                init_kwargs["device_id"] = torch.device("cuda", local_rank)
+        except Exception:
+            pass
+
+    dist.init_process_group(**init_kwargs)
     return DdpInfo(
         enabled=True,
         rank=rank,
@@ -990,6 +1003,20 @@ def _init_ddp(*, cfg: TrainConfig, device_str: str) -> DdpInfo:
         world_size=world_size,
         backend=backend,
     )
+
+
+def _ddp_barrier(ddp: DdpInfo, device: torch.device) -> None:
+    if not ddp.enabled:
+        return
+    import torch.distributed as dist
+
+    if device.type == "cuda":
+        try:
+            dist.barrier(device_ids=[int(device.index)])
+            return
+        except TypeError:
+            pass
+    dist.barrier()
 
 
 def _get_batch(
@@ -1613,7 +1640,7 @@ def main() -> None:
         ):
             _write_text(tokenizer_json_path, tokenizer.to_json())
         if ddp.enabled:
-            dist.barrier()
+            _ddp_barrier(ddp, device)
     else:
         if cfg.tokenizer == "char":
             if not os.path.exists(cfg.data_path):
@@ -1639,7 +1666,7 @@ def main() -> None:
                     )
                     _write_text(tokenizer_json_path, tokenizer.to_json())
                 if ddp.enabled:
-                    dist.barrier()
+                    _ddp_barrier(ddp, device)
 
             # All ranks load the tokenizer from disk to ensure consistency.
             tokenizer = BpeTokenizer.from_json(_read_text(tokenizer_json_path))
@@ -1651,10 +1678,10 @@ def main() -> None:
             if ddp.enabled:
                 if is_main_process:
                     data = _load_or_build_memmap_tokens(cfg=cfg, tokenizer=tokenizer)
-                dist.barrier()
+                _ddp_barrier(ddp, device)
                 if not is_main_process:
                     data = _load_or_build_memmap_tokens(cfg=cfg, tokenizer=tokenizer)
-                dist.barrier()
+                _ddp_barrier(ddp, device)
             else:
                 data = _load_or_build_memmap_tokens(cfg=cfg, tokenizer=tokenizer)
             split_idx = int(0.9 * data.size(0))
@@ -1801,7 +1828,7 @@ def main() -> None:
         if ddp.enabled:
             import torch.distributed as dist
 
-            dist.barrier()
+            _ddp_barrier(ddp, device)
             dist.destroy_process_group()
         return
 
@@ -1921,7 +1948,7 @@ def main() -> None:
                         print(f"saved best checkpoint to {ckpt_best_path}")
 
                 if ddp.enabled:
-                    dist.barrier()
+                    _ddp_barrier(ddp, device)
 
             if cfg.sample_interval > 0 and (step + 1) % cfg.sample_interval == 0:
                 if is_main_process:
@@ -1949,7 +1976,7 @@ def main() -> None:
                     print("--------------")
 
                 if ddp.enabled:
-                    dist.barrier()
+                    _ddp_barrier(ddp, device)
     except KeyboardInterrupt:
         print("interrupted; saving latest checkpoint...")
     finally:
@@ -1970,7 +1997,7 @@ def main() -> None:
                 print(f"saved checkpoint to {ckpt_path}")
 
         if ddp.enabled:
-            dist.barrier()
+            _ddp_barrier(ddp, device)
             dist.destroy_process_group()
 
 

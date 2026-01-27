@@ -97,6 +97,8 @@ Notes:
 - `--batch_size` is **per GPU**. Effective batch is `batch_size * grad_accum_steps * world_size`.
 - Only rank 0 writes checkpoints/logs to `--out_dir`.
 - Backend defaults to `--ddp_backend auto` (NCCL on Linux+CUDA, otherwise Gloo).
+- If `torchrun` prints an `OMP_NUM_THREADS` warning, set it yourself before launching, e.g. `OMP_NUM_THREADS=1 torchrun ...`.
+- If you see noisy `[c10d] hostname ...` warnings in some notebook/container environments, it’s usually harmless (reverse DNS). You can silence C++ warnings with `TORCH_CPP_LOG_LEVEL=ERROR`.
 
 ## Generate Text
 
