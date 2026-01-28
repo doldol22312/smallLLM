@@ -209,7 +209,7 @@ python train_tinyllm.py --curriculum --curriculum_start_block_size 32
 python train_tinyllm.py \
   --generate_only \
   --prompt "The future of AI is" \
-  --temperature 0.8 --top_p 0.9 --kv_cache
+  --temperature 0.8 --top_p 0.9
 ```
 </details>
 

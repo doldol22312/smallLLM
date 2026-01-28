@@ -166,10 +166,9 @@ class TinyLLMGUI:
         self.add_entry(model_group, "Sliding window (0=off):", "sliding_window", "0", 10)
         self.add_check(model_group, "QK-Norm", "qk_norm", False, 11)
         self.add_entry(model_group, "QK-Norm eps:", "qk_norm_eps", "1e-5", 12)
-        self.add_check(model_group, "Parallel block", "parallel_block", False, 13)
-        self.add_entry(model_group, "LayerDrop (0..1):", "layerdrop", "0.0", 14)
-        self.add_check(model_group, "Scaled init", "scaled_init", True, 15)
-        self.add_check(model_group, "Weight tying", "weight_tying", False, 16)
+        self.add_entry(model_group, "LayerDrop (0..1):", "layerdrop", "0.0", 13)
+        self.add_check(model_group, "Scaled init", "scaled_init", True, 14)
+        self.add_check(model_group, "Weight tying", "weight_tying", False, 15)
 
         train_group = ttk.LabelFrame(scroll, text="Training")
         train_group.pack(fill="x", pady=5)
@@ -188,14 +187,13 @@ class TinyLLMGUI:
         self.add_entry(train_group, "Grad clip:", "grad_clip", "1.0", 12)
         self.add_check(train_group, "Grad checkpointing", "grad_checkpointing", False, 13)
         self.add_entry(train_group, "Label smoothing:", "label_smoothing", "0.0", 14)
-        self.add_entry(train_group, "Z-loss:", "z_loss", "0.0", 15)
-        self.add_check(train_group, "EMA", "ema", False, 16)
-        self.add_entry(train_group, "EMA decay:", "ema_decay", "0.9999", 17)
-        self.add_entry(train_group, "EMA update every:", "ema_update_every", "1", 18)
-        self.add_entry(train_group, "EMA start step:", "ema_start_step", "0", 19)
-        self.add_check(train_group, "Curriculum (ramp block size)", "curriculum", False, 20)
-        self.add_entry(train_group, "Curriculum start block size:", "curriculum_start_block_size", "32", 21)
-        self.add_entry(train_group, "Curriculum steps:", "curriculum_steps", "2000", 22)
+        self.add_check(train_group, "EMA", "ema", False, 15)
+        self.add_entry(train_group, "EMA decay:", "ema_decay", "0.9999", 16)
+        self.add_entry(train_group, "EMA update every:", "ema_update_every", "1", 17)
+        self.add_entry(train_group, "EMA start step:", "ema_start_step", "0", 18)
+        self.add_check(train_group, "Curriculum (ramp block size)", "curriculum", False, 19)
+        self.add_entry(train_group, "Curriculum start block size:", "curriculum_start_block_size", "32", 20)
+        self.add_entry(train_group, "Curriculum steps:", "curriculum_steps", "2000", 21)
 
         eval_group = ttk.LabelFrame(scroll, text="Eval & Sampling")
         eval_group.pack(fill="x", pady=5)
@@ -209,7 +207,6 @@ class TinyLLMGUI:
         self.add_entry(eval_group, "Sample top-k:", "train_top_k", "0", 7)
         self.add_entry(eval_group, "Sample top-p:", "train_top_p", "1.0", 8)
         self.add_entry(eval_group, "Sample repetition penalty:", "train_repetition_penalty", "1.0", 9)
-        self.add_check(eval_group, "Sample with KV cache", "train_kv_cache", False, 10)
 
         perf_group = ttk.LabelFrame(scroll, text="Performance")
         perf_group.pack(fill="x", pady=5)
@@ -249,8 +246,7 @@ class TinyLLMGUI:
         self.add_entry(gen_group, "Top K (0=off):", "top_k", "0", 4)
         self.add_entry(gen_group, "Top P:", "top_p", "1.0", 5)
         self.add_entry(gen_group, "Repetition penalty:", "repetition_penalty", "1.0", 6)
-        self.add_check(gen_group, "Use KV Cache", "kv_cache", True, 7)
-        self.add_option(gen_group, "Use EMA weights:", "use_ema", ["auto", "true", "false"], 8)
+        self.add_option(gen_group, "Use EMA weights:", "use_ema", ["auto", "true", "false"], 7)
         
         btn_gen = ttk.Button(container, text="Generate Text", command=self.start_generation)
         btn_gen.pack(fill="x", pady=10)
@@ -416,8 +412,6 @@ class TinyLLMGUI:
         else: cmd.append("--no-qk_norm")
         cmd.extend(["--qk_norm_eps", self.vars["qk_norm_eps"].get()])
 
-        if self.vars["parallel_block"].get(): cmd.append("--parallel_block")
-        else: cmd.append("--no-parallel_block")
         cmd.extend(["--layerdrop", self.vars["layerdrop"].get()])
 
         if self.vars["scaled_init"].get(): cmd.append("--scaled_init")
@@ -447,7 +441,6 @@ class TinyLLMGUI:
         if self.vars["grad_checkpointing"].get(): cmd.append("--grad_checkpointing")
         else: cmd.append("--no-grad_checkpointing")
         cmd.extend(["--label_smoothing", self.vars["label_smoothing"].get()])
-        cmd.extend(["--z_loss", self.vars["z_loss"].get()])
         if self.vars["ema"].get(): cmd.append("--ema")
         else: cmd.append("--no-ema")
         cmd.extend(["--ema_decay", self.vars["ema_decay"].get()])
@@ -469,8 +462,6 @@ class TinyLLMGUI:
         cmd.extend(["--top_k", self.vars["train_top_k"].get()])
         cmd.extend(["--top_p", self.vars["train_top_p"].get()])
         cmd.extend(["--repetition_penalty", self.vars["train_repetition_penalty"].get()])
-        if self.vars["train_kv_cache"].get(): cmd.append("--kv_cache")
-        else: cmd.append("--no-kv_cache")
 
         if self.vars["amp"].get(): cmd.append("--amp")
         else: cmd.append("--no-amp")
@@ -502,9 +493,6 @@ class TinyLLMGUI:
         cmd.extend(["--top_k", self.vars["top_k"].get()])
         cmd.extend(["--top_p", self.vars["top_p"].get()])
         cmd.extend(["--repetition_penalty", self.vars["repetition_penalty"].get()])
-        
-        if self.vars["kv_cache"].get(): cmd.append("--kv_cache")
-        else: cmd.append("--no-kv_cache")
 
         use_ema = self.vars["use_ema"].get()
         if use_ema == "true":

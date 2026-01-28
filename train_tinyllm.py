@@ -72,7 +72,6 @@ class TrainConfig:
     norm: str = "layernorm"  # layernorm|rmsnorm
     norm_eps: float = 1e-5
     mlp: str = "gelu"  # gelu|swiglu
-    parallel_block: bool = False
     layerdrop: float = 0.0
     pos_encoding: str = "learned"  # learned|rope
     rope_base: float = 10000.0
@@ -88,13 +87,11 @@ class TrainConfig:
     ddp_backend: str = "auto"  # auto|nccl|gloo
     ddp_find_unused_parameters: bool = False
     ddp_timeout: int = 1800
-    kv_cache: bool = False
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 1.0
     repetition_penalty: float = 1.0
     label_smoothing: float = 0.0
-    z_loss: float = 0.0
     ema: bool = False
     ema_decay: float = 0.9999
     ema_update_every: int = 1
@@ -357,9 +354,6 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
         self.sliding_window = int(cfg.sliding_window) if cfg.sliding_window else 0
-        self.max_cache_len = (
-            min(self.sliding_window, cfg.block_size) if self.sliding_window > 0 else cfg.block_size
-        )
         if self.sliding_window > 0:
             i = torch.arange(cfg.block_size)[:, None]
             j = torch.arange(cfg.block_size)[None, :]
@@ -446,58 +440,6 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.proj(y))
         return y
 
-    def forward_with_kv_cache(
-        self,
-        x: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor] | None,
-        *,
-        start_pos: int,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        batch_size, seq_len, embed_dim = x.shape
-        qkv = self.qkv(x)
-        q, k, v = qkv.split(embed_dim, dim=2)
-
-        q = q.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
-
-        if self.use_rope:
-            cos, sin = self._get_rope_cos_sin(
-                seq_len, start_pos=start_pos, device=x.device, dtype=q.dtype
-            )
-            q = self._apply_rope(q, cos, sin)
-            k = self._apply_rope(k, cos, sin)
-
-        if self.qk_norm:
-            q = self._apply_qk_norm(q)
-            k = self._apply_qk_norm(k)
-
-        attn_mask = None
-        if kv_cache is None and self.sliding_window > 0 and self.sliding_window < seq_len:
-            attn_mask = self.sliding_attn_mask[:seq_len, :seq_len]
-
-        if kv_cache is not None:
-            if seq_len != 1:
-                raise ValueError("KV cache only supports seq_len=1 (one token at a time)")
-            k_cache, v_cache = kv_cache
-            k = torch.cat((k_cache, k), dim=2)
-            v = torch.cat((v_cache, v), dim=2)
-
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=kv_cache is None,
-        )
-        y = y.transpose(1, 2).contiguous().view(batch_size, seq_len, embed_dim)
-        y = self.resid_dropout(self.proj(y))
-        if self.max_cache_len and k.size(2) > self.max_cache_len:
-            k = k[:, :, -self.max_cache_len :, :]
-            v = v[:, :, -self.max_cache_len :, :]
-        return y, (k, v)
-
 
 class MLP(nn.Module):
     def __init__(self, cfg: TrainConfig):
@@ -537,7 +479,6 @@ class Block(nn.Module):
             self.ln_2 = RMSNorm(cfg.n_embd, eps=cfg.norm_eps)
         else:
             raise ValueError(f"Unknown norm type: {cfg.norm!r}")
-        self.parallel = bool(cfg.parallel_block)
         if cfg.layerdrop and cfg.layerdrop > 0:
             if cfg.n_layer > 1:
                 self.layerdrop = float(cfg.layerdrop) * float(layer_idx) / float(cfg.n_layer - 1)
@@ -552,35 +493,9 @@ class Block(nn.Module):
         if self.layerdrop and self.training:
             if torch.rand((), device=x.device) < self.layerdrop:
                 return x
-
-        if self.parallel:
-            x = x + self.attn(self.ln_1(x)) + self.mlp(self.ln_2(x))
-            return x
-
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
-
-    def forward_with_kv_cache(
-        self,
-        x: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor] | None,
-        *,
-        start_pos: int,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        if self.parallel:
-            attn_out, new_kv = self.attn.forward_with_kv_cache(
-                self.ln_1(x), kv_cache, start_pos=start_pos
-            )
-            x = x + attn_out + self.mlp(self.ln_2(x))
-            return x, new_kv
-
-        attn_out, new_kv = self.attn.forward_with_kv_cache(
-            self.ln_1(x), kv_cache, start_pos=start_pos
-        )
-        x = x + attn_out
-        x = x + self.mlp(self.ln_2(x))
-        return x, new_kv
 
 
 class TinyGPT(nn.Module):
@@ -625,53 +540,29 @@ class TinyGPT(nn.Module):
     def forward(
         self, idx: torch.Tensor, targets: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        logits, loss, _ = self._forward_impl(idx, targets)
+        logits, loss = self._forward_impl(idx, targets)
         return logits, loss
 
     def _forward_impl(
         self,
         idx: torch.Tensor,
         targets: torch.Tensor | None,
-        *,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
-        start_pos: int = 0,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor | None,
-        list[tuple[torch.Tensor, torch.Tensor]] | None,
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch_size, seq_len = idx.shape
         if seq_len > self.cfg.block_size:
             raise ValueError("Sequence length exceeds block_size")
 
         x = self.token_emb(idx)
         if self.pos_emb is not None:
-            if start_pos < 0 or start_pos + seq_len > self.cfg.block_size:
-                raise ValueError("Sequence positions exceed block_size")
-            positions = torch.arange(start_pos, start_pos + seq_len, device=idx.device)
+            positions = torch.arange(seq_len, device=idx.device)
             x = x + self.pos_emb(positions)
         x = self.drop(x)
 
-        new_kv_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None
-        if kv_cache is None:
-            for block in self.blocks:
-                if (
-                    self.cfg.grad_checkpointing
-                    and self.training
-                    and torch.is_grad_enabled()
-                ):
-                    x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
-                else:
-                    x = block(x)
-        else:
-            if len(kv_cache) != len(self.blocks):
-                raise ValueError("kv_cache must have one entry per Transformer block")
-            new_kv_cache = []
-            for block, layer_cache in zip(self.blocks, kv_cache):
-                x, out_cache = block.forward_with_kv_cache(
-                    x, layer_cache, start_pos=start_pos
-                )
-                new_kv_cache.append(out_cache)
+        for block in self.blocks:
+            if self.cfg.grad_checkpointing and self.training and torch.is_grad_enabled():
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -683,22 +574,7 @@ class TinyGPT(nn.Module):
                 targets.view(-1),
                 label_smoothing=float(self.cfg.label_smoothing or 0.0),
             )
-            if self.cfg.z_loss and self.cfg.z_loss > 0:
-                log_z = torch.logsumexp(logits.float(), dim=-1)
-                loss = loss + float(self.cfg.z_loss) * (log_z**2).mean()
-        return logits, loss, new_kv_cache
-
-    @torch.no_grad()
-    def forward_with_kv_cache(
-        self,
-        idx: torch.Tensor,
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor] | None],
-        *,
-        start_pos: int,
-    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        logits, _, new_kv = self._forward_impl(idx, None, kv_cache=kv_cache, start_pos=start_pos)
-        assert new_kv is not None
-        return logits, new_kv
+        return logits, loss
 
     @torch.no_grad()
     def generate(
@@ -709,122 +585,47 @@ class TinyGPT(nn.Module):
         top_k: int = 0,
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
-        use_kv_cache: bool | None = None,
     ) -> torch.Tensor:
-        if use_kv_cache is None:
-            use_kv_cache = bool(self.cfg.kv_cache)
-
-        if not use_kv_cache:
-            for _ in range(max_new_tokens):
-                idx_cond = idx[:, -self.cfg.block_size :]
-                logits, _ = self(idx_cond)
-                logits = logits[:, -1, :]
-
-                if repetition_penalty and repetition_penalty != 1.0:
-                    for b in range(logits.size(0)):
-                        token_ids = torch.unique(idx_cond[b])
-                        token_logits = logits[b, token_ids]
-                        logits[b, token_ids] = torch.where(
-                            token_logits > 0,
-                            token_logits / repetition_penalty,
-                            token_logits * repetition_penalty,
-                        )
-
-                logits = logits / max(temperature, 1e-8)
-
-                if top_k and top_k > 0:
-                    values, _ = torch.topk(logits, k=min(top_k, logits.size(-1)))
-                    logits[logits < values[:, [-1]]] = -float("inf")
-
-                if top_p and 0.0 < top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-                    sorted_probs = F.softmax(sorted_logits, dim=-1)
-                    cumulative_probs = sorted_probs.cumsum(dim=-1)
-
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[
-                        :, :-1
-                    ].clone()
-                    sorted_indices_to_remove[:, 0] = False
-
-                    indices_to_remove = sorted_indices_to_remove.scatter(
-                        1, sorted_indices, sorted_indices_to_remove
-                    )
-                    logits = logits.masked_fill(indices_to_remove, -float("inf"))
-
-                probs = F.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-                idx = torch.cat((idx, next_token), dim=1)
-            return idx
-
-        if self.pos_emb is not None and idx.size(1) + max_new_tokens > self.cfg.block_size:
-            # Learned absolute embeddings can't extrapolate positions. Fall back to non-cached generation.
-            return self.generate(
-                idx,
-                max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                use_kv_cache=False,
-            )
-
-        kv_cache: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * len(self.blocks)
-        full_prompt_len = idx.size(1)
-        idx_cond = idx[:, -self.cfg.block_size :]
-        start_pos = 0 if self.pos_emb is not None else full_prompt_len - idx_cond.size(1)
-        logits, kv_cache_filled = self.forward_with_kv_cache(
-            idx_cond, kv_cache, start_pos=start_pos
-        )
-        kv_cache = kv_cache_filled
-
-        pos_cursor = full_prompt_len
         for _ in range(max_new_tokens):
-            logits_step = logits[:, -1, :]
-
             idx_cond = idx[:, -self.cfg.block_size :]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :]
+
             if repetition_penalty and repetition_penalty != 1.0:
-                for b in range(logits_step.size(0)):
+                for b in range(logits.size(0)):
                     token_ids = torch.unique(idx_cond[b])
-                    token_logits = logits_step[b, token_ids]
-                    logits_step[b, token_ids] = torch.where(
+                    token_logits = logits[b, token_ids]
+                    logits[b, token_ids] = torch.where(
                         token_logits > 0,
                         token_logits / repetition_penalty,
                         token_logits * repetition_penalty,
                     )
 
-            logits_step = logits_step / max(temperature, 1e-8)
+            logits = logits / max(temperature, 1e-8)
 
             if top_k and top_k > 0:
-                values, _ = torch.topk(logits_step, k=min(top_k, logits_step.size(-1)))
-                logits_step[logits_step < values[:, [-1]]] = -float("inf")
+                values, _ = torch.topk(logits, k=min(top_k, logits.size(-1)))
+                logits[logits < values[:, [-1]]] = -float("inf")
 
             if top_p and 0.0 < top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(
-                    logits_step, descending=True, dim=-1
-                )
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
                 sorted_probs = F.softmax(sorted_logits, dim=-1)
                 cumulative_probs = sorted_probs.cumsum(dim=-1)
 
                 sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[
+                    :, :-1
+                ].clone()
                 sorted_indices_to_remove[:, 0] = False
 
                 indices_to_remove = sorted_indices_to_remove.scatter(
                     1, sorted_indices, sorted_indices_to_remove
                 )
-                logits_step = logits_step.masked_fill(indices_to_remove, -float("inf"))
+                logits = logits.masked_fill(indices_to_remove, -float("inf"))
 
-            probs = F.softmax(logits_step, dim=-1)
+            probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, next_token), dim=1)
-
-            step_start_pos = pos_cursor
-            logits, kv_cache = self.forward_with_kv_cache(
-                next_token, kv_cache, start_pos=step_start_pos
-            )
-            pos_cursor += 1
-
         return idx
 
 
@@ -1318,7 +1119,6 @@ def _parse_args() -> argparse.Namespace:
         help="Enable gradient checkpointing to reduce VRAM (slower).",
     )
     parser.add_argument("--label_smoothing", type=float, default=None)
-    parser.add_argument("--z_loss", type=float, default=None)
     parser.add_argument(
         "--ema",
         action=argparse.BooleanOptionalAction,
@@ -1387,12 +1187,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--norm", default=None, choices=["layernorm", "rmsnorm"])
     parser.add_argument("--norm_eps", type=float, default=None)
     parser.add_argument("--mlp", default=None, choices=["gelu", "swiglu"])
-    parser.add_argument(
-        "--parallel_block",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Compute attention and MLP in parallel (parallel residual).",
-    )
     parser.add_argument("--layerdrop", type=float, default=None)
     parser.add_argument("--pos_encoding", default=None, choices=["learned", "rope"])
     parser.add_argument("--rope_base", type=float, default=None)
@@ -1451,12 +1245,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--repetition_penalty", type=float, default=None)
-    parser.add_argument(
-        "--kv_cache",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Use a KV-cache during generation for faster sampling.",
-    )
 
     return parser.parse_args()
 
@@ -1687,7 +1475,6 @@ def main() -> None:
             "compile_dynamic": args.compile_dynamic,
             "amp": args.amp,
             "label_smoothing": args.label_smoothing,
-            "z_loss": args.z_loss,
             "ema": args.ema,
             "ema_decay": args.ema_decay,
             "ema_update_every": args.ema_update_every,
@@ -1707,7 +1494,6 @@ def main() -> None:
             "norm": args.norm,
             "norm_eps": args.norm_eps,
             "mlp": args.mlp,
-            "parallel_block": args.parallel_block,
             "layerdrop": args.layerdrop,
             "pos_encoding": args.pos_encoding,
             "rope_base": args.rope_base,
@@ -1728,7 +1514,6 @@ def main() -> None:
             "top_k": args.top_k,
             "top_p": args.top_p,
             "repetition_penalty": args.repetition_penalty,
-            "kv_cache": args.kv_cache,
         },
     )
 
@@ -1809,7 +1594,6 @@ def main() -> None:
                     "compile_dynamic": args.compile_dynamic,
                     "amp": args.amp,
                     "label_smoothing": args.label_smoothing,
-                    "z_loss": args.z_loss,
                     "ema": args.ema,
                     "ema_decay": args.ema_decay,
                     "ema_update_every": args.ema_update_every,
@@ -1825,7 +1609,6 @@ def main() -> None:
                     "dropout": args.dropout,
                     "norm": args.norm,
                     "norm_eps": args.norm_eps,
-                    "parallel_block": args.parallel_block,
                     "layerdrop": args.layerdrop,
                     "scaled_init": args.scaled_init,
                     "device": args.device,
@@ -1843,7 +1626,6 @@ def main() -> None:
                     "sliding_window": args.sliding_window,
                     "qk_norm": args.qk_norm,
                     "qk_norm_eps": args.qk_norm_eps,
-                    "kv_cache": args.kv_cache,
                 },
             )
 
@@ -1853,8 +1635,6 @@ def main() -> None:
         raise ValueError("--qk_norm_eps must be > 0")
     if cfg.label_smoothing < 0 or cfg.label_smoothing >= 1:
         raise ValueError("--label_smoothing must be in [0, 1)")
-    if cfg.z_loss < 0:
-        raise ValueError("--z_loss must be >= 0")
     if cfg.layerdrop < 0 or cfg.layerdrop >= 1:
         raise ValueError("--layerdrop must be in [0, 1)")
     if cfg.dataloader_workers < 0:
