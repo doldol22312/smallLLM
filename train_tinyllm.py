@@ -2171,6 +2171,9 @@ def main() -> None:
 
     train_batch_iter = None
     if cfg.dataloader_workers > 0:
+        if cfg.tokenizer == "bpe":
+            # Avoid noisy warning (and occasional deadlocks) when tokenizers is used before DataLoader forks.
+            os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         from torch.utils.data import DataLoader
 
         if cfg.memmap_dataset:
@@ -2219,6 +2222,7 @@ def main() -> None:
     last_log_time = time.time()
     last_log_step = start_step
     last_step = start_step
+    interrupted = False
     try:
         for step in range(start_step, cfg.max_steps):
             assert train_data is not None
@@ -2389,8 +2393,11 @@ def main() -> None:
                 if ddp.enabled:
                     _ddp_barrier(ddp, device)
     except KeyboardInterrupt:
+        interrupted = True
         print("interrupted; saving latest checkpoint...")
     finally:
+        exc_type, _, _ = sys.exc_info()
+        clean_exit = exc_type is None and not interrupted
         if last_step > start_step:
             assert optimizer is not None
             if is_main_process:
@@ -2410,8 +2417,12 @@ def main() -> None:
                 print(f"saved checkpoint to {ckpt_path}")
 
         if ddp.enabled:
-            _ddp_barrier(ddp, device)
-            dist.destroy_process_group()
+            if clean_exit:
+                _ddp_barrier(ddp, device)
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
